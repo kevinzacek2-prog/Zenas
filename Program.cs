@@ -1,12 +1,13 @@
 ﻿// Program.cs
 using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using zenas;
 using zenas.Handling;
 using zenas.Phoenix;
+using zenas.Services;
+using zenas.Watchers;
 
 var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -17,212 +18,160 @@ var scanner = new PhoenixWindowScanner("Phoenix Bot");
 var manager = new PhoenixClientManager("127.0.0.1", scanner, refreshMs: 2000);
 
 var handler = new PacketHandler();
+var mapWatcher = new MapIdWatcher(handler);
 
-// pending query – port+type -> timestamp (16/19)
-var pending = new ConcurrentDictionary<(int port, int type), DateTime>();
+// ✅ Controller, co řeší jen Phoenix start/stop/continue podle mapy
+var phoenix = new PhoenixBotController(manager, handler, mapWatcher);
 
-manager.ClientAdded += (_, x) => Console.WriteLine($"[PORT+] {x.port} = {x.name}");
-manager.ClientRemoved += (_, x) => Console.WriteLine($"[PORT-] {x.port} (byl {x.name})");
-manager.ConnectionChanged += (_, x) => Console.WriteLine($"[TCP] {x.name}:{x.port} connected={(x.connected ? "yes" : "no")}");
-manager.ClientFaulted += (_, x) => Console.WriteLine($"[ERR] {x.name}:{x.port} {x.ex.GetType().Name}: {x.ex.Message}");
+// ✅ Raid manager řeší jen raid logiku (Phase1 jen při portálu)
+var raid = new RaidManager(manager, handler, mapWatcher);
 
-manager.JsonReceived += (_, x) => handler.HandleIncomingJson(x.port, x.name, x.json);
+var consoleLock = new object();
+void SafeWriteLine(string text) { lock (consoleLock) Console.WriteLine(text); }
 
-handler.PortalDetected += (_, x) =>
-    Console.WriteLine($"[PORTAL:{x.port}] {x.name}: id={x.portal.PortalId} @ ({x.portal.X},{x.portal.Y})");
-
-// volitelně: loguj c_map (jinak zakomentuj)
-// handler.RawPacketRecv += (_, x) => Console.WriteLine($"[PKT:{x.port}] {x.name}: {x.packet}");
-
-// když přijde type=16/19 a čekali jsme na to, vypiš to hned
-handler.QueryResponse += (_, x) =>
+void PrintHelp()
 {
-    if (pending.TryRemove((x.port, x.type), out var _))
-    {
-        Console.WriteLine($"[QUERY-RESULT:{x.port}] {x.name} type={x.type} @ {x.ts:O}");
-        Console.WriteLine(x.json);
-    }
+    SafeWriteLine("Příkazy:");
+    SafeWriteLine("  ports");
+    SafeWriteLine("  role <port> <leader|bodyguard|buffer|leecher>");
+    SafeWriteLine("  start <port>");
+    SafeWriteLine("  stop <port>");
+    SafeWriteLine("  continue <port>");
+    SafeWriteLine("  status <port>");
+    SafeWriteLine("  phoenix continue <port>");
+    SafeWriteLine("  phoenix status <port>");
+    SafeWriteLine("  help");
+    SafeWriteLine("  quit");
+}
+
+manager.ClientAdded += (_, x) => SafeWriteLine($"[PORT+] {x.port} = {x.name}");
+manager.ClientRemoved += (_, x) => SafeWriteLine($"[PORT-] {x.port} (byl {x.name})");
+manager.ConnectionChanged += (_, x) => SafeWriteLine($"[TCP] {x.name}:{x.port} connected={(x.connected ? "yes" : "no")}");
+manager.ClientFaulted += (_, x) => SafeWriteLine($"[ERR] {x.name}:{x.port} {x.ex.GetType().Name}: {x.ex.Message}");
+
+// ✅ krm map watcher vždy (type=16 si z toho vezme mapId)
+manager.JsonReceived += (_, x) =>
+{
+    mapWatcher.TryUpdateFromAnyJson(x.port, x.name, x.json);
+    handler.HandleIncomingJson(x.port, x.name, x.json);
 };
+
+// log jen důležité věci
+handler.MapChanged += (_, x) => SafeWriteLine($"[MAP:{x.port}] {x.name}: mapId={x.mapId} (c_map)");
+mapWatcher.MapChanged += (_, x) => SafeWriteLine($"[MAP16:{x.port}] {x.name}: mapId={x.mapId} (type16)");
+handler.PortalDetected += (_, x) => SafeWriteLine($"[PORTAL:{x.port}] {x.name}: id={x.portal.PortalId} type={x.portal.PortalType} @ ({x.portal.X},{x.portal.Y})");
+
+// ENTITIES log vypnutý (ať se dá psát)
+// handler.EntitiesUpdated += (_, x) => SafeWriteLine($"[ENTITIES:{x.port}] {x.name}: count={x.entities.Count}");
 
 await manager.StartAsync(cts.Token);
 
-var consoleTask = Task.Run(async () =>
+// poller: type=16+19 jen pro running porty (raid)
+var pollerTask = Task.Run(async () =>
 {
-    PrintHelp();
-
     while (!cts.IsCancellationRequested)
     {
-        Console.Write("> ");
-        var line = Console.ReadLine();
-        if (line == null) continue;
-
-        line = line.Trim();
-        if (line.Length == 0) continue;
-
-        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        var cmd = parts[0].ToLowerInvariant();
-
-        if (cmd is "quit" or "exit") { cts.Cancel(); break; }
-        if (cmd == "help") { PrintHelp(); continue; }
-
-        if (cmd == "ports")
+        try
         {
-            foreach (var p in manager.Snapshot())
-                Console.WriteLine($"{p.port} = {p.name}");
-            continue;
-        }
-
-        if (cmd == "query")
-        {
-            // query <port|name|all> <player|inv|skills|entities>
-            if (parts.Length < 3)
-            {
-                Console.WriteLine("Použití: query <port|name|all> <player|inv|skills|entities>");
-                continue;
-            }
-
-            var target = parts[1];
-            var kind = parts[2].ToLowerInvariant();
-
-            int type = kind switch
-            {
-                "player" => 16,
-                "inv" => 17,
-                "skills" => 18,
-                "entities" => 19,
-                _ => -1
-            };
-
-            if (type < 0)
-            {
-                Console.WriteLine("Neznámý typ. Použij: player | inv | skills | entities");
-                continue;
-            }
-
-            var ports = ResolvePorts(manager, target);
-            if (ports.Count == 0)
-            {
-                Console.WriteLine("Nenalezen žádný port pro cíl.");
-                continue;
-            }
-
-            int sent = 0;
+            var ports = manager.Snapshot().Select(s => s.port).Distinct().ToList();
             foreach (var p in ports)
             {
-                if (await manager.SendAsync(p, new { type }, cts.Token))
-                {
-                    sent++;
-                    if (type == 16 || type == 19)
-                        pending[(p, type)] = DateTime.UtcNow;
-                }
+                if (!raid.IsRunning(p)) continue;
+                _ = manager.SendAsync(p, new { type = 16 }, cts.Token);
+                _ = manager.SendAsync(p, new { type = 19 }, cts.Token);
             }
-
-            Console.WriteLine($"OK: query {kind} {target} (odesláno {sent}x)");
-            continue;
         }
+        catch { }
 
-        if (cmd == "last")
-        {
-            // last <player|entities> <port|name|all>
-            if (parts.Length < 3)
-            {
-                Console.WriteLine("Použití: last <player|entities> <port|name|all>");
-                continue;
-            }
-
-            var what = parts[1].ToLowerInvariant();
-            var target = parts[2];
-
-            var ports = ResolvePorts(manager, target);
-            if (ports.Count == 0)
-            {
-                Console.WriteLine("Nenalezen žádný port pro cíl.");
-                continue;
-            }
-
-            foreach (var p in ports)
-            {
-                if (what == "player")
-                {
-                    var v = handler.GetLastPlayerInfo(p);
-                    Console.WriteLine(v is null ? $"[{p}] player: žádná data" : $"[{p}] player @ {v.Value.ts:O}\n{v.Value.json}");
-                }
-                else if (what == "entities")
-                {
-                    var v = handler.GetLastEntities(p);
-                    Console.WriteLine(v is null ? $"[{p}] entities: žádná data" : $"[{p}] entities @ {v.Value.ts:O}\n{v.Value.json}");
-                }
-                else
-                {
-                    Console.WriteLine("last: použij player | entities");
-                    break;
-                }
-            }
-
-            continue;
-        }
-
-        if (cmd == "map")
-        {
-            // map <port|name|all>
-            if (parts.Length < 2)
-            {
-                Console.WriteLine("Použití: map <port|name|all>");
-                continue;
-            }
-
-            var target = parts[1];
-            var ports = ResolvePorts(manager, target);
-            if (ports.Count == 0)
-            {
-                Console.WriteLine("Nenalezen žádný port pro cíl.");
-                continue;
-            }
-
-            foreach (var p in ports)
-            {
-                var mi = handler.Maps.Get(p);
-                if (mi == null)
-                    Console.WriteLine($"[{p}] map: žádná data (čekej na c_map / změň mapu ve hře)");
-                else
-                    Console.WriteLine($"[{p}] {mi.Name} mapId={mi.MapId} @ {mi.UpdatedUtc:O}");
-            }
-
-            continue;
-        }
-
-        Console.WriteLine("Neznámý příkaz. Napiš: help");
+        try { await Task.Delay(1200, cts.Token); } catch { }
     }
-});
+}, cts.Token);
 
-try { await consoleTask; } catch { }
+PrintHelp();
+
+while (!cts.IsCancellationRequested)
+{
+    Console.Write("> ");
+    var line = Console.ReadLine();
+    if (line == null) continue;
+
+    line = line.Trim();
+    if (line.Length == 0) continue;
+
+    var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    var cmd = parts[0].ToLowerInvariant();
+
+    if (cmd is "quit" or "exit") { cts.Cancel(); break; }
+    if (cmd == "help") { PrintHelp(); continue; }
+
+    if (cmd == "ports")
+    {
+        foreach (var p in manager.Snapshot())
+            SafeWriteLine($"{p.port} = {p.name}");
+        continue;
+    }
+
+    if (cmd == "role")
+    {
+        if (parts.Length < 3) { SafeWriteLine("Použití: role <port> <leader|bodyguard|buffer|leecher>"); continue; }
+        if (!int.TryParse(parts[1], out var port)) { SafeWriteLine("role: zadej číslo portu"); continue; }
+        if (!Enum.TryParse<BotRole>(parts[2], true, out var role)) { SafeWriteLine("Neznámá role"); continue; }
+
+        raid.SetRole(port, role);
+        SafeWriteLine($"[{port}] role set -> {role}");
+        continue;
+    }
+
+    if (cmd is "start" or "stop" or "continue")
+    {
+        if (parts.Length < 2) { SafeWriteLine("Použití: start|stop|continue <port>"); continue; }
+        if (!int.TryParse(parts[1], out var port)) { SafeWriteLine($"{cmd}: zadej číslo portu"); continue; }
+
+        if (cmd == "start") raid.Start(port);
+        else if (cmd == "stop") raid.Stop(port);
+        else raid.Continue(port);
+
+        SafeWriteLine($"OK: {cmd} {port}");
+        continue;
+    }
+
+    if (cmd == "status")
+    {
+        if (parts.Length < 2) { SafeWriteLine("Použití: status <port>"); continue; }
+        if (!int.TryParse(parts[1], out var port)) { SafeWriteLine("status: zadej číslo portu"); continue; }
+
+        SafeWriteLine($"[{port}] running={raid.IsRunning(port)} role={raid.GetRole(port)} phase={raid.GetPhase(port)}");
+        continue;
+    }
+
+    if (cmd == "phoenix")
+    {
+        if (parts.Length < 3) { SafeWriteLine("Použití: phoenix <continue|status> <port>"); continue; }
+        var sub = parts[1].ToLowerInvariant();
+        if (!int.TryParse(parts[2], out var port)) { SafeWriteLine("phoenix: zadej číslo portu"); continue; }
+
+        if (sub == "continue")
+        {
+            await phoenix.SendContinueAsync(port);
+            SafeWriteLine($"OK: phoenix continue {port}");
+        }
+        else if (sub == "status")
+        {
+            SafeWriteLine($"[{port}] phoenix lastMap={phoenix.GetLastMap(port)} lastCmd={phoenix.GetLastCommand(port)}");
+        }
+        else
+        {
+            SafeWriteLine("Použití: phoenix <continue|status> <port>");
+        }
+
+        continue;
+    }
+
+    SafeWriteLine("Neznámý příkaz. Napiš: help");
+}
+
+try { await pollerTask; } catch { }
+
+await raid.DisposeAsync();
+await phoenix.DisposeAsync();
 await manager.DisposeAsync();
-
-static List<int> ResolvePorts(PhoenixClientManager manager, string target)
-{
-    var snap = manager.Snapshot();
-
-    if (string.Equals(target, "all", StringComparison.OrdinalIgnoreCase))
-        return snap.Select(x => x.port).Distinct().OrderBy(x => x).ToList();
-
-    if (int.TryParse(target, out var port))
-        return new List<int> { port };
-
-    return snap
-        .Where(x => x.name.Equals(target, StringComparison.OrdinalIgnoreCase))
-        .Select(x => x.port)
-        .Distinct()
-        .OrderBy(x => x)
-        .ToList();
-}
-
-static void PrintHelp()
-{
-    Console.WriteLine("Příkazy:");
-    Console.WriteLine("  ports");
-    Console.WriteLine("  query <port|name|all> <player|inv|skills|entities>");
-    Console.WriteLine("  last <player|entities> <port|name|all>");
-    Console.WriteLine("  map <port|name|all>");
-    Console.WriteLine("  help");
-    Console.WriteLine("  quit");
-}
